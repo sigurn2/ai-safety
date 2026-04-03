@@ -1,0 +1,12 @@
+# 敏感配置
+.env
+
+# 数据库
+*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
