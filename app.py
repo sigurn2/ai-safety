@@ -8,7 +8,6 @@ import hashlib
 import pandas as pd
 import sqlite3
 import json
-import time
 import os
 from datetime import datetime
 from dotenv import load_dotenv
@@ -24,52 +23,209 @@ LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen2.5-72B-Instruct")
 # --- 1. 核心导入兼容性处理 ---
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
 from crawl4ai.extraction_strategy import LLMExtractionStrategy
-from typing import Optional, List, Any # 导入类型提示工具
+from typing import Optional, List, Any, Tuple  # 类型提示
 
 try:
     from crawl4ai.async_configs import LLMConfig # type: ignore
 except:
     from crawl4ai.config import LLMConfig # type: ignore
 
-from schema import AIIncident, ExtractionResult # type: ignore
+from schema import AIIncident, ExtractionResult, RISK_DOMAIN_CHOICES  # type: ignore
 
 # --- 2. 数据库操作逻辑 ---
 DB_PATH = 'ai_governance.db'
 
 
+def _table_column_names(conn: sqlite3.Connection, table: str) -> List[str]:
+    """读取 SQLite 表当前有哪些列（用于兼容旧版 incidents 表，避免升级后无法启动）。"""
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return [row[1] for row in cur.fetchall()]
+
+
+def _migrate_incidents_schema(conn: sqlite3.Connection) -> None:
+    """
+    在保留旧数据的前提下，为 incidents 追加三元模型相关列。
+    历史版本中「风险等级」同步拷到 risk_level。
+    """
+    cols = set(_table_column_names(conn, "incidents"))
+    if "risk_level" not in cols:
+        conn.execute("ALTER TABLE incidents ADD COLUMN risk_level TEXT")
+    if "risk_domain" not in cols:
+        conn.execute("ALTER TABLE incidents ADD COLUMN risk_domain TEXT")
+    if "risk_subdomain" not in cols:
+        conn.execute("ALTER TABLE incidents ADD COLUMN risk_subdomain TEXT")
+    if "category" in cols:
+        conn.execute(
+            """
+            UPDATE incidents
+            SET risk_level = category
+            WHERE (risk_level IS NULL OR trim(risk_level) = '')
+              AND category IS NOT NULL AND trim(category) != ''
+            """
+        )
+
+#初始化数据库
 def init_db():
+    """初始化/迁移本地 SQLite：事件表、关键词池、风险分类演进表。"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS incidents
-                 (id TEXT PRIMARY KEY, title TEXT, category TEXT, entity TEXT,
-                  content TEXT, url TEXT, tags TEXT, timestamp DATETIME)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS watched_keywords
-                 (keyword TEXT PRIMARY KEY, first_seen DATETIME, count INTEGER DEFAULT 1)''')
+    # 先创建与历史版本一致的 incidents 骨架；新列一律通过迁移追加，老库也能平滑升级
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS incidents
+                 (id TEXT PRIMARY KEY, #事件id
+                 title TEXT, #事件标题
+                 category TEXT, #事件分类
+                 entity TEXT, #事件涉及主体
+                 content TEXT, #事件内容
+                 url TEXT, #事件url
+                 tags TEXT, #事件标签
+                 timestamp DATETIME  #事件时间)"""
+    )
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS watched_keywords
+                 (keyword TEXT PRIMARY KEY, #关键词
+                 first_seen DATETIME, #首次出现时间
+                 count INTEGER DEFAULT 1 #出现次数)"""
+    )
+    # 动态子域演进表：主域 + 子域 联合主键，统计出现次数（自增长分类体系的核心存储）
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS risk_taxonomy
+                 (domain TEXT NOT NULL,
+                  subdomain TEXT NOT NULL,
+                  first_seen DATETIME,
+                  count INTEGER DEFAULT 1,
+                  PRIMARY KEY (domain, subdomain))"""
+    )
+    _migrate_incidents_schema(conn) #迁移 incidents 表
     conn.commit()
     conn.close()
 
 
-def get_stats():
+def coerce_risk_domain(raw: Optional[str]) -> str:
+    """
+    将 LLM 可能返回的近似表述归一到三条 canonical 主域字符串之一。
+    避免模型少写一个括号就导致整条解析失败。
+    """
+    if not raw or not isinstance(raw, str):
+        return RISK_DOMAIN_CHOICES[2]
+    v = raw.strip()
+    if v in RISK_DOMAIN_CHOICES:
+        return v
+    low = v.lower()
+    if "恶意" in v or "malicious" in low or "abuse" in low or "攻击" in v:
+        return RISK_DOMAIN_CHOICES[0]
+    if "意外" in v or "失效" in v or "鲁棒" in v or "accidental" in low or "failure" in low or "halluc" in low:
+        return RISK_DOMAIN_CHOICES[1]
+    if "系统" in v or "伦理" in v or "systemic" in low or "ethical" in low or "bias" in low or "偏见" in v:
+        return RISK_DOMAIN_CHOICES[2]
+    return RISK_DOMAIN_CHOICES[2]
+
+
+def incident_from_extraction(d: dict) -> AIIncident:
+    """把 LLM 返回的单条 dict 清洗后转为 AIIncident（补全缺省主域/子域）。"""
+    data = dict(d)
+    data["risk_domain"] = coerce_risk_domain(data.get("risk_domain"))
+    sub = data.get("risk_subdomain")
+    if sub is None or str(sub).strip() == "":
+        data["risk_subdomain"] = "未指定子域"
+    else:
+        data["risk_subdomain"] = str(sub).strip()[:160]
+    return AIIncident(**data)
+
+
+def _bump_risk_taxonomy_cursor(c: sqlite3.Cursor, domain: str, subdomain: str) -> bool:
+    """
+    在同一事务内更新 risk_taxonomy：已存在则 count+1，否则插入。
+    返回 True 表示本次为「全新 (主域, 子域) 组合」。
+    """
+    domain = (domain or "").strip()
+    subdomain = (subdomain or "").strip()
+    if not domain or not subdomain:
+        return False
+    c.execute(
+        "SELECT count FROM risk_taxonomy WHERE domain = ? AND subdomain = ?",
+        (domain, subdomain),
+    )
+    row = c.fetchone()
+    if row:
+        c.execute(
+            "UPDATE risk_taxonomy SET count = count + 1 WHERE domain = ? AND subdomain = ?",
+            (domain, subdomain),
+        )
+        return False
+    c.execute(
+        "INSERT INTO risk_taxonomy (domain, subdomain, first_seen, count) VALUES (?, ?, ?, 1)",
+        (domain, subdomain, datetime.now()),
+    )
+    return True
+
+
+def get_stats() -> Tuple[int, int, int]:
+    """返回 (事件条数, 不重复标签数, 风险子域种类数)。"""
     conn = sqlite3.connect(DB_PATH)
-    count = pd.read_sql_query("SELECT COUNT(*) as total FROM incidents", conn).iloc[0]['total']
+    count = int(pd.read_sql_query("SELECT COUNT(*) as total FROM incidents", conn).iloc[0]["total"])
     tags = pd.read_sql_query("SELECT tags FROM incidents", conn)
+    try:
+        tax_n = int(pd.read_sql_query("SELECT COUNT(*) AS n FROM risk_taxonomy", conn).iloc[0]["n"])
+    except Exception:
+        tax_n = 0
     conn.close()
-    unique_tags = set([t for sublist in tags['tags'].str.split(',') if sublist for t in sublist if t])
-    return count, len(unique_tags)
+    unique_tags: set = set()
+    if not tags.empty and "tags" in tags.columns:
+        for sublist in tags["tags"].dropna().astype(str).str.split(","):
+            if sublist is not None:
+                unique_tags.update(t for t in sublist if t)
+    return count, len(unique_tags), tax_n
 
 
-def save_incident(incident: AIIncident, source_url: str = ""):
+def get_risk_taxonomy_df() -> pd.DataFrame:
+    """读取完整风险分类演进表，供看板与图表使用。"""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql_query(
+            "SELECT domain, subdomain, count, first_seen FROM risk_taxonomy ORDER BY domain, count DESC",
+            conn,
+        )
+    except Exception:
+        df = pd.DataFrame(columns=["domain", "subdomain", "count", "first_seen"])
+    conn.close()
+    return df
+
+
+def save_incident(incident: AIIncident, source_url: str = "") -> Tuple[bool, bool]:
+    """
+    保存一条事件到 incidents，并在同一事务内更新 risk_taxonomy。
+    返回 (是否成功插入 incidents, 是否首次出现该 主域+子域 组合)。
+    """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     inc_id = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{hashlib.md5(incident.title.encode()).hexdigest()[:6]}"
+    tag_str = ",".join(incident.tags)
+    now = datetime.now()
     try:
-        c.execute("INSERT INTO incidents VALUES (?,?,?,?,?,?,?,?)",
-                  (inc_id, incident.title, incident.risk_level,
-                   incident.entity, incident.summary, source_url,
-                   ",".join(incident.tags), datetime.now()))
+        c.execute(
+            """INSERT INTO incidents
+               (id, title, risk_level, risk_domain, risk_subdomain, entity, content, url, tags, timestamp)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                inc_id,
+                incident.title,
+                incident.risk_level,
+                incident.risk_domain,
+                incident.risk_subdomain,
+                incident.entity,
+                incident.summary,
+                source_url,
+                tag_str,
+                now,
+            ),
+        )
+        tax_new = _bump_risk_taxonomy_cursor(c, incident.risk_domain, incident.risk_subdomain)
         conn.commit()
+        return True, tax_new
     except sqlite3.IntegrityError:
-        pass
+        conn.rollback()
+        return False, False
     finally:
         conn.close()
 
@@ -118,8 +274,8 @@ def update_watched_keywords(new_tags: list) -> list:
 async def run_agentic_crawl(url: str, api_key: Optional[str] = None, base_url: Optional[str] = None, debug: bool = False):
     """
     执行 Agent 侦察任务：
-    - 抓取目标 URL 并语义提取 AI 治理相关事件
-    - 自动更新待观察关键词池
+    - 抓取目标 URL 并语义提取 AI 治理相关事件（含三元风险主域 + 动态子域）
+    - 自动更新待观察关键词池；子域演进在入库时写入 risk_taxonomy 表
     返回: (incidents_list, newly_added_keywords, debug_info)
     """
     # IS_DEMO_MODE = False  # 网络不稳定时改为 True 
@@ -139,10 +295,19 @@ async def run_agentic_crawl(url: str, api_key: Optional[str] = None, base_url: O
     #     )
     #     return demo_incidents, new_kw, ["[演示模式] 返回示例数据"]
 
+    run_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
     _api_key  = api_key  or API_KEY
     _base_url = base_url or BASE_URL
     _model = f"openai/{LLM_MODEL}"  #
-
+    # 运行级可配置超时：默认 90s，降低跨境站点偶发慢加载导致的 30s 导航超时
+    try:
+        crawl_page_timeout_ms = int(os.getenv("CRAWL_PAGE_TIMEOUT_MS", "90000"))
+    except Exception:
+        crawl_page_timeout_ms = 90000
+    # Playwright page.goto 的 wait_until：默认 commit（比 domcontentloaded 更早放行），避免首包已回但 DCL 长期不触发导致超时
+    crawl_wait_until = (os.getenv("CRAWL_WAIT_UNTIL", "commit") or "commit").strip()
+    # 使用运行级 session_id，避免固定会话在命中反爬后“粘住”后续请求
+    crawl_session_id = f"ai_monitor_{run_id}"
     if not _api_key:
         debug_log.append("❌ API Key 未配置，请在 .env 文件中设置 DASHSCOPE_API_KEY")
         return [], [], debug_log
@@ -161,34 +326,41 @@ async def run_agentic_crawl(url: str, api_key: Optional[str] = None, base_url: O
             schema=ExtractionResult.model_json_schema(),
             #extra_args=extra_args,
             instruction=(
-                "你是一个 AI 治理领域的专家分析师。仔细分析网页内容，识别所有与 AI 治理、AI 安全、AI 政策、AI 监管相关的内容。\n"
-                "对每条相关内容，精确提取以下信息（JSON 格式）：\n"
+                "你是一个 AI 治理与安全领域的专家分析师。仔细分析网页内容，识别所有与 AI 治理、AI 安全、AI 政策、AI 监管相关的内容。\n"
+                "对每条相关内容，精确提取以下字段（JSON 格式）：\n"
                 "1. title（标题）：事件、报告、新闻或会议的标题\n"
                 "2. entity（涉及主体）：提及的机构、公司、政府或人物名称\n"
-                "3. risk_level（风险等级）：根据内容判断，填写'高'、'中'、'低'中的一个\n"
-                "4. summary（摘要）：用一句话（不超过60字）总结核心内容\n"
-                "5. tags（标签）：提取 3-8 个关键词，可以是中文或英文\n\n"
+                "3. risk_level（风险等级）：根据内容判断，填写「高」「中」「低」之一\n"
+                "4. risk_domain（风险主域 — 意图与来源三元模型）：必须从以下三项中**原样**选一条字符串（含英文与中文括号）：\n"
+                "   - Malicious Use (恶意滥用)：人类恶意利用 AI，或对 AI 系统发起主动攻击（越狱、投毒、深度伪造诈骗、自动化网络攻击等）。\n"
+                "   - Accidental Failure (意外失效)：无恶意攻击者，因系统缺陷、幻觉或复杂环境下的失效（严重幻觉、自动驾驶误判、域外泛化失败等）。\n"
+                "   - Systemic & Ethical Risk (系统性与伦理风险)：系统按预期运行，但对社会或个人权益产生负面影响（算法偏见、隐私、版权、信息茧房、就业冲击等）。\n"
+                "5. risk_subdomain（风险子域）：在该主域下的简短专业子类型（如「越狱攻击」「数据投毒」「算法偏见」）。同类现象用语尽量一致，新现象可创造清晰新词。\n"
+                "6. summary（摘要）：一句话不超过 60 字\n"
+                "7. tags（标签）：3-8 个关键词，中英文均可\n\n"
                 "重要提示：\n"
-                "- 只提取与 AI 治理/安全相关的内容，不相关的忽略\n"
-                "- 不要捏造数据或杜撰内容\n"
-                "- 如果页面没有相关内容，返回空的 incidents 列表\n"
-                "- 返回结构必须是 JSON：{\"incidents\": [{...}, {...}]} 或 {\"incidents\": []}"
+                "- 只提取与 AI 治理/安全相关的内容；risk_domain 三条字符串必须与上文完全一致\n"
+                "- 不要捏造事实\n"
+                "- 若无相关内容，incidents 为空数组\n"
+                "- 返回 JSON：{\"incidents\": [...]} "
             )
         )
 
+        # 不在此设置 wait_for：AsyncPlaywright 策略在 goto 后已 wait_for_selector("body")，
+        # 再设 wait_for="body" 会进入第二轮 smart_wait，在反爬/挑战页上易重复超时。
         config = CrawlerRunConfig(
             extraction_strategy=extraction_strategy, #核心提取策略
             cache_mode=CacheMode.BYPASS, #不使用缓存，每次都重新爬取网页
-            wait_for="body", # 确保 body 加载
-            page_timeout=30000,       # 增加超时到 30 秒，防止网络卡顿
-            session_id="ai_monitor_session", #处理一些复杂的 JavaScript 渲染
+            wait_until=crawl_wait_until,  # 与 Playwright page.goto 一致；见 crawl4ai async_crawler_strategy goto
+            page_timeout=crawl_page_timeout_ms,  # 可配置超时：默认 90 秒
+            session_id=crawl_session_id,  # 运行级 session，减少反爬状态跨次污染
             js_code="window.scrollTo(0, document.body.scrollHeight);" # 模拟滚动以触发懒加载
         )
 
         async with AsyncWebCrawler() as crawler:
             debug_log.append("📡 正在爬取目标 URL...")
             # 这里的 result 其实就是普通的 object
-            result: Any = await crawler.arun(url=url, config=config)
+            result: Any = await crawler.arun(url=url, config=config) # 爬虫返回结果
 
             debug_log.append(f"✓ 爬虫返回: success={result.success}")
 
@@ -203,8 +375,8 @@ async def run_agentic_crawl(url: str, api_key: Optional[str] = None, base_url: O
             debug_log.append(f"✓ 获取到内容（长度: {len(str(result.extracted_content))} 字符）")
 
             try:
-                raw = result.extracted_content
-                data = json.loads(raw) if isinstance(raw, str) else raw
+                raw = result.extracted_content # 原始内容
+                data = json.loads(raw) if isinstance(raw, str) else raw   
                 debug_log.append(f"✓ LLM 提取完成，返回类型: {type(data)}")
             except Exception as e:
                 debug_log.append(f"❌ JSON 解析失败: {str(e)}")
@@ -273,13 +445,13 @@ def main():
 
     st.title("🛡️ 全球 AI 治理监测与自增长 Agent 系统")
 
-    # 动态获取指标
-    total_incidents, total_tags = get_stats()
+    # 动态获取指标（第三项为 risk_taxonomy 中不同「主域+子域」组合数量）
+    total_incidents, total_tags, taxonomy_kinds = get_stats()
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("已监测信源", "142", "+5")
     m2.metric("识别风险线索", total_incidents, f"+{total_incidents}")
     m3.metric("知识库节点", "856", "稳定")
-    m4.metric("自增长标签", total_tags, f"+{total_tags}")
+    m4.metric("自增长标签 / 子域种数", f"{total_tags} / {taxonomy_kinds}", help="标签去重数与动态风险子域种类数")
 
     # 侧边栏
     with st.sidebar:
@@ -319,15 +491,24 @@ def main():
                         st.write(log_line)
 
                     if incidents_data:
+                        new_sub_pairs: List[str] = []
                         for inc_dict in incidents_data:
                             try:
-                                inc = AIIncident(**inc_dict)
-                                save_incident(inc, target_url)
-                                st.write(f"✅ 发现新线索: **{inc.title}**")
+                                inc = incident_from_extraction(inc_dict)
+                                ok, tax_new = save_incident(inc, target_url)
+                                if ok:
+                                    st.write(
+                                        f"✅ 发现新线索: **{inc.title}** "
+                                        f"〔{inc.risk_domain.split('(')[0].strip()} / {inc.risk_subdomain}〕"
+                                    )
+                                    if tax_new:
+                                        new_sub_pairs.append(f"{inc.risk_subdomain}")
                             except Exception:
                                 pass
                         if new_keywords:
                             st.write(f"🧬 新增进化标签: {', '.join(new_keywords)}")
+                        if new_sub_pairs:
+                            st.write(f"🌳 本次新出现的风险子域: {', '.join(new_sub_pairs)}")
                         status.update(label="感知完成！知识库已更新", state="complete")
                     else:
                         status.update(label="未发现新线索或提取失败", state="error")
@@ -348,8 +529,20 @@ def main():
         with c_l:
             st.subheader("📍 最新监测动态")
             conn = sqlite3.connect(DB_PATH)
+            # COALESCE：兼容仅存在旧列 category、尚未回填 risk_level 的历史行
             df = pd.read_sql_query(
-                "SELECT title, category, entity, timestamp FROM incidents ORDER BY timestamp DESC LIMIT 10", conn
+                """
+                SELECT title,
+                       COALESCE(NULLIF(trim(risk_level), ''), category) AS risk_level,
+                       risk_domain,
+                       risk_subdomain,
+                       entity,
+                       timestamp
+                FROM incidents
+                ORDER BY timestamp DESC
+                LIMIT 10
+                """,
+                conn,
             )
             if not df.empty:
                 st.dataframe(df, use_container_width=True, hide_index=True)
@@ -357,10 +550,38 @@ def main():
                 st.info("暂无监测数据，请从侧边栏启动感知。")
             conn.close()
 
+            # 三元模型 + 动态子域：只读展示 risk_taxonomy（关系库存储，便于日后同步到图数据库）
+            st.subheader("🌳 动态风险分类体系（三元主域 → 子域）")
+            tax_df = get_risk_taxonomy_df()
+            if tax_df.empty:
+                st.caption("尚无子域数据；成功入库带 risk_subdomain 的事件后，此处会自动累积。")
+            else:
+                dom_cols = st.columns(3)
+                for i, domain_label in enumerate(RISK_DOMAIN_CHOICES):
+                    short = domain_label.split("(")[0].strip()
+                    sub_df = tax_df[tax_df["domain"] == domain_label].head(12)
+                    with dom_cols[i]:
+                        st.markdown(f"**{short}**")
+                        if sub_df.empty:
+                            st.caption("—")
+                        else:
+                            for _, row in sub_df.iterrows():
+                                st.caption(f"- {row['subdomain']}（×{int(row['count'])}）")
+
         with c_r:
-            st.subheader("🔥 风险热度分布")
-            chart_data = pd.DataFrame({'维度': ['技术', '合规', '伦理', '生存'], '热度': [40, 25, 20, 15]})
-            st.bar_chart(chart_data, x='维度', y='热度', color="#00f2fe")
+            st.subheader("🔥 子域出现频次（Top）")
+            tax_df_chart = get_risk_taxonomy_df()
+            if tax_df_chart.empty:
+                st.caption("暂无统计数据。")
+            else:
+                topn = tax_df_chart.sort_values("count", ascending=False).head(12).copy()
+                # 横轴标签带上主域简写，避免不同主域下出现同名子域时难以区分
+                short_dom = topn["domain"].astype(str).str.replace(r"\s*\(.+$", "", regex=True)
+                topn["label"] = topn["subdomain"].astype(str) + " · " + short_dom
+                chart_data = pd.DataFrame(
+                    {"子域": topn["label"], "次数": topn["count"].astype(int)}
+                )
+                st.bar_chart(chart_data, x="子域", y="次数", color="#00f2fe")
 
     with tab2:
         st.subheader("🕸️ 自动化自增长血缘图")
@@ -379,7 +600,16 @@ def main():
                 report_md = f"## 📅 AI 治理动态监测内参 ({datetime.now().strftime('%Y-%m-%d')})\n\n"
                 report_md += "### 一、 核心风险预警\n"
                 for _, row in today_data.iterrows():
-                    report_md += f"- **[{row['category']}]** {row['title']} (涉及主体: {row['entity']})\n"
+                    lvl = row.get("risk_level")
+                    if lvl is None or (isinstance(lvl, float) and pd.isna(lvl)) or str(lvl).strip() == "":
+                        lvl = row.get("category", "")
+                    dom = row.get("risk_domain", "") or ""
+                    sub = row.get("risk_subdomain", "") or ""
+                    tri = f"{dom} / {sub}".strip(" /")
+                    report_md += f"- **[{lvl}]** {row['title']} (涉及主体: {row['entity']})"
+                    if tri:
+                        report_md += f" — 分类: {tri}"
+                    report_md += "\n"
 
                 report_md += "\n### 二、 新兴术语与概念感知\n"
                 all_tags = ",".join(today_data['tags'].fillna('')).split(',')
@@ -439,19 +669,24 @@ def main():
                         st.caption(log_line)
 
                 if incidents_data:
-                    # 入库
+                    # 入库（与侧边栏共用：三元主域 + 子域写入 incidents，并 bump risk_taxonomy）
                     saved_count = 0
+                    new_subs_session: List[str] = []
                     for inc_dict in incidents_data:
                         try:
-                            inc = AIIncident(**inc_dict)
-                            save_incident(inc, scout_url)
-                            saved_count += 1
+                            inc = incident_from_extraction(inc_dict)
+                            ok, tax_new = save_incident(inc, scout_url)
+                            if ok:
+                                saved_count += 1
+                                if tax_new:
+                                    new_subs_session.append(inc.risk_subdomain)
                         except Exception:
                             pass
 
                     # 更新 session state
                     st.session_state["scout_results"] = incidents_data
                     st.session_state["scout_new_kw"] = new_keywords
+                    st.session_state["scout_new_subdomains"] = new_subs_session
                     st.session_state["scout_url_used"] = scout_url
 
                     st.success(
@@ -462,6 +697,8 @@ def main():
                         preview = ', '.join(new_keywords[:5])
                         extra = f" …等 {len(new_keywords)} 个" if len(new_keywords) > 5 else f"，共 {len(new_keywords)} 个"
                         st.info(f"🧬 新增进化标签：{preview}{extra}")
+                    if new_subs_session:
+                        st.info(f"🌳 本次新收录的风险子域：{', '.join(new_subs_session)}")
                 else:
                     st.warning(
                         "⚠️ 未发现 AI 治理相关线索。\n\n"
@@ -532,6 +769,8 @@ def main():
             st.metric("关键词总量", kw_total, help="已观察的 AI 治理领域关键词总数")
             new_session_kw = len(st.session_state.get("scout_new_kw", []))
             st.metric("本次新增", new_session_kw, help="本次侦察新发现的关键词数量")
+            new_sub_n = len(st.session_state.get("scout_new_subdomains", []))
+            st.metric("本次新子域", new_sub_n, help="本次侦察首次出现的 主域+子域 组合数")
 
 
 if __name__ == "__main__":
