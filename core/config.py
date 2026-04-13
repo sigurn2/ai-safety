@@ -4,7 +4,7 @@
 功能：集中从 .env / 环境变量读取 LLM、嵌入、SQLite、爬虫与 RAG 开关，避免业务模块散落 os.getenv。
 输入：进程环境；部分项支持非法数字时回退默认值。
 输出：模块级常量（字符串/整型/布尔）；副作用：首次 import 时 load_dotenv(override=True)。
-上下游：被 core.db、core.llm_client、crawler、engine.rag_ingestion 读取；Streamlit 侧展示 API 状态时可复用。
+上下游：被 core.db、core.llm_client、crawler（含卫报 Content API 客户端）、engine.rag_ingestion 读取；Streamlit 侧展示 API 状态时可复用。
 """
 
 from __future__ import annotations
@@ -27,6 +27,16 @@ EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 DB_PATH: str = os.getenv("DB_PATH", "ai_governance.db")
 # Chroma 子域向量库（本地目录，非独立服务）
 CHROMA_PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "chroma_data")
+
+# --- Guardian Open Platform---
+# 功能：供 crawler.sources.guardian 等模块构造 search 请求；空字符串表示未配置。
+# 输入：环境变量 GUARDIAN_API_KEY；根地址可选 GUARDIAN_API_BASE，未设时可回退 GUARDIAN_BASE。
+# 输出：字符串常量；无额外 IO。
+GUARDIAN_API_KEY: str = (os.getenv("GUARDIAN_API_KEY", "") or "").strip()
+GUARDIAN_API_BASE: str = (
+    (os.getenv("GUARDIAN_API_BASE") or os.getenv("GUARDIAN_BASE") or "").strip()
+    or "https://content.guardianapis.com"
+).rstrip("/")
 
 # --- Crawl4ai / Playwright ---
 try:

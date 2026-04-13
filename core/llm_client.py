@@ -9,6 +9,7 @@ OpenAI 兼容 HTTP 客户端（聊天 + 嵌入）。
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, List, Optional
 
@@ -133,14 +134,56 @@ class OpenAICompatibleBackend:
         上下游：供 engine.rag_ingestion.router 做结构化分类。
         """
         raw = self.chat_completion(messages, model=model, temperature=temperature, timeout=timeout).strip()
-        if raw.startswith("```"):
-            raw = raw[3:].lstrip()
-            if raw.lower().startswith("json"):
-                raw = raw[4:].lstrip()
-            end = raw.rfind("```")
-            if end != -1:
-                raw = raw[:end]
-        return json.loads(raw.strip())
+        return _strip_json_fence(raw)
+
+    async def async_chat_completion_json(
+        self,
+        messages: List[dict[str, str]],
+        *,
+        model: Optional[str] = None,
+        temperature: float = 0.1,
+        timeout: float = 120.0,
+    ) -> Any:
+        """
+        功能：异步聊天补全并解析为 JSON；与 chat_completion_json 语义一致，用于并发场景。
+        输入：OpenAI 风格 messages；其余与同步版一致。
+        输出：json.loads 后的 Python 对象；副作用：异步 HTTP。
+        上下游：crawler.extraction.async_extract_incidents_from_text 并发调用。
+        """
+        if not self._api_key:
+            raise RuntimeError("DASHSCOPE_API_KEY is not set")
+        m = model or self._default_chat_model
+        url = f"{self._base_url}/chat/completions"
+        payload: dict[str, Any] = {
+            "model": m,
+            "messages": messages,
+            "temperature": temperature,
+        }
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.post(url, headers=self._headers(), json=payload)
+            r.raise_for_status()
+            data = r.json()
+        try:
+            content = str(data["choices"][0]["message"]["content"])
+        except (KeyError, IndexError, TypeError) as e:
+            raise ValueError(f"unexpected chat completion payload: {data!r}") from e
+        return _strip_json_fence(content.strip())
+
+
+def _strip_json_fence(raw: str) -> Any:
+    """
+    功能：剥离 LLM 回复中常见的 ``` / ```json 代码围栏后解析 JSON。
+    输入：原始字符串（已 strip）。
+    输出：json.loads 结果；无 IO。
+    """
+    if raw.startswith("```"):
+        raw = raw[3:].lstrip()
+        if raw.lower().startswith("json"):
+            raw = raw[4:].lstrip()
+        end = raw.rfind("```")
+        if end != -1:
+            raw = raw[:end]
+    return json.loads(raw.strip())
 
 
 _default_backend: Optional[OpenAICompatibleBackend] = None

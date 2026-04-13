@@ -1,0 +1,25 @@
+[Unit]
+Description=AI Safety Governance Dashboard (Streamlit)
+After=network.target
+
+[Service]
+User=liwr
+WorkingDirectory=/home/liwr/ai-safety
+# 从 .env 加载所有密钥（DASHSCOPE_API_KEY、GUARDIAN_API_KEY、DEMO_PASSWORD 等）
+EnvironmentFile=/home/liwr/ai-safety/.env
+# ⚠️ 必须使用虚拟环境里的 Python，否则找不到 streamlit 等依赖。
+# 部署前请先执行：which python 或 ls venv/bin/python 确认路径，然后按实际修改下一行。
+ExecStart=/home/liwr/ai-safety/venv/bin/python -m streamlit run app.py \
+    --server.port 8501 \
+    --server.address 127.0.0.1 \
+    --server.headless true \
+    --server.enableCORS false \
+    --server.enableXsrfProtection false
+Restart=always
+RestartSec=5
+# 防止日志写满磁盘
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
