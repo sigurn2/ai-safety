@@ -4,9 +4,15 @@
 # 数据库
 *.db
 
+# Chroma 持久化目录
+chroma_data/
+
 # Python
 __pycache__/
 *.pyc
 *.pyo
 .venv/
 venv/
+
+# 本地 Cursor 规则（不提交远端）
+.cursor/rules/chinese-docs-evolvable.mdc

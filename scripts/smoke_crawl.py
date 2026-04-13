@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-不调用 LLM 的爬取冒烟测试：验证 Crawl4AI 能否完成导航（与 app.py 中导航参数对齐）。
+不调用 LLM 的爬取冒烟测试：验证 Crawl4AI 能否完成导航。
+
+功能：快速确认 Playwright/网络环境；与 core.config 中 CRAWL_* 默认值对齐。
+输入：命令行可选 URL，否则默认 CSET 新闻页。
+输出：进程退出码 0/1；标准输出打印 success 与 html 长度。
+上下游：独立脚本，不经过 Streamlit；与 crawler.agentic_crawl（含 LLM）无关。
 
 用法（在项目根目录）:
   ./venv/bin/python scripts/smoke_crawl.py [URL]
 
-环境变量（与 app 一致）:
+环境变量（与 core.config 一致）:
   CRAWL_PAGE_TIMEOUT_MS  默认 90000
   CRAWL_WAIT_UNTIL       默认 commit
 """

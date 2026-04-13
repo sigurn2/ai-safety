@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from typing import List, Literal
 
 # ---------------------------------------------------------------------------
-# 三元模型：三大主域（与 app.py 中 LLM 提示词、SQLite 中存储的字符串保持一致）
+# 三元模型：三大主域（与 LLM 提示词、SQLite 中存储的字符串保持一致）
 # ---------------------------------------------------------------------------
 RISK_DOMAIN_CHOICES = (
     "Malicious Use (恶意滥用)",
@@ -27,7 +27,14 @@ RiskDomainLiteral = Literal[
 
 
 class AIIncident(BaseModel):
-    """单条 AI 治理/安全相关情报的结构化表示。"""
+    """
+    单条 AI 治理/安全情报（入库与 API 的契约形状）。
+
+    功能：统一 title/主体/三元风险/摘要/标签字段，供 Pydantic 校验与 SQLite 落库。
+    输入：通常来自 LLM 抽取 dict，经 core.db.incident_from_extraction 转换。
+    输出：不可变业务对象；写库由 save_incident 完成。
+    上下游：crawl 抽取 →（可选 RAG）→ incident_from_extraction → incidents 表。
+    """
 
     title: str = Field(..., description="事件或会议标题")
     entity: str = Field(..., description="涉及主体（如 OpenAI、欧盟、中国工信部）")
@@ -47,6 +54,12 @@ class AIIncident(BaseModel):
 
 
 class ExtractionResult(BaseModel):
-    """LLM 批量提取时的根对象（对应 JSON 里的 incidents 数组）。"""
+    """
+    Crawl4AI LLMExtractionStrategy 的根 JSON 结构（{"incidents": [...]}）。
+
+    功能：为抽取策略提供 model_json_schema，约束 incidents 数组元素形状。
+    输入：由 crawl4ai 根据网页内容调用 LLM 生成。
+    输出：校验后的对象树；下游解析兼容 list-only 等畸形输出在 crawler 内处理。
+    """
 
     incidents: List[AIIncident]
