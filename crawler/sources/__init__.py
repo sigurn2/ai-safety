@@ -17,14 +17,28 @@ from crawler.sources.guardian import (
     search_articles,
     search_articles_multipage,
 )
+from crawler.sources.nyt import (
+    DEFAULT_NYT_AI_GOVERNANCE_QUERY,
+    NYTAPIError,
+    NYTSearchPage,
+    map_nyt_doc_to_raw_article,
+    search_nyt_articles,
+    search_nyt_articles_multipage,
+)
 
 __all__ = [
     "DEFAULT_AI_GOVERNANCE_QUERY",
+    "DEFAULT_NYT_AI_GOVERNANCE_QUERY",
     "GuardianAPIError",
     "GuardianSearchPage",
+    "NYTAPIError",
+    "NYTSearchPage",
     "RawArticle",
     "map_result_to_raw_article",
+    "map_nyt_doc_to_raw_article",
     "raw_article_to_llm_context",
     "search_articles",
     "search_articles_multipage",
+    "search_nyt_articles",
+    "search_nyt_articles_multipage",
 ]

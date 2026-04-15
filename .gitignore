@@ -16,3 +16,9 @@ venv/
 
 # 本地 Cursor 规则（不提交远端）
 .cursor/rules/chinese-docs-evolvable.mdc
+
+# UV enviroment setting
+uv.lock
+.python-version
+pyproject.toml
+.vscode
