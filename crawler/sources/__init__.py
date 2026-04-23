@@ -25,6 +25,16 @@ from crawler.sources.nyt import (
     search_nyt_articles,
     search_nyt_articles_multipage,
 )
+from crawler.sources.xinhua_net import (
+    XINHUA_TECH_URL,
+    XinhuaNetError,
+    XinhuaTechPage,
+    extract_xinhua_tech_links,
+    fetch_xinhua_tech_article,
+    parse_xinhua_article,
+    search_xinhua_tech_articles,
+    search_xinhua_tech_articles_multipage,
+)
 
 __all__ = [
     "DEFAULT_AI_GOVERNANCE_QUERY",
@@ -34,11 +44,19 @@ __all__ = [
     "NYTAPIError",
     "NYTSearchPage",
     "RawArticle",
-    "map_result_to_raw_article",
+    "XINHUA_TECH_URL",
+    "XinhuaNetError",
+    "XinhuaTechPage",
     "map_nyt_doc_to_raw_article",
+    "map_result_to_raw_article",
+    "extract_xinhua_tech_links",
+    "fetch_xinhua_tech_article",
+    "parse_xinhua_article",
     "raw_article_to_llm_context",
     "search_articles",
     "search_articles_multipage",
     "search_nyt_articles",
     "search_nyt_articles_multipage",
+    "search_xinhua_tech_articles",
+    "search_xinhua_tech_articles_multipage",
 ]
