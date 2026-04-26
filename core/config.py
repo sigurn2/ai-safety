@@ -38,6 +38,10 @@ GUARDIAN_API_BASE: str = (
     or "https://content.guardianapis.com"
 ).rstrip("/")
 
+# --- New York Times Developer APIs ---
+NYT_API_KEY: str = (os.getenv("NYT_API_KEY", "") or "").strip()
+NYT_API_BASE: str = ((os.getenv("NYT_API_BASE") or "").strip() or "https://api.nytimes.com").rstrip("/")
+
 # --- Crawl4ai / Playwright ---
 try:
     CRAWL_PAGE_TIMEOUT_MS: int = int(os.getenv("CRAWL_PAGE_TIMEOUT_MS", "90000"))
