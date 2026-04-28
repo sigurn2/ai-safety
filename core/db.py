@@ -108,6 +108,11 @@ def coerce_risk_domain(raw: Optional[str]) -> str:
     if not raw or not isinstance(raw, str):
         return RISK_DOMAIN_CHOICES[2]
     v = raw.strip()
+    # 去掉「xxx（xxx）」中全角括号及后缀，避免模型重复输出导致无法精确匹配枚举
+    if "（" in v:
+        left = v.split("（", 1)[0].strip()
+        if left:
+            v = left
     if v in RISK_DOMAIN_CHOICES:
         return v
     low = v.lower()

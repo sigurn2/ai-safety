@@ -1,11 +1,11 @@
 """
 Streamlit 应用入口：AI 治理监测演示看板（汇报版）。
 
-功能：三 Tab 只读看板（缓存全部查询，领导打开稳定不卡）；
+功能：四 Tab 看板（监测 / 情报 / 深度调研 / 系统）；缓存全部查询；
      侧边栏受密码保护的操作区供现场演示触发同步与 Agent 侦察。
-输入：SQLite 数据库（DB_PATH）；操作区依赖 LLM API Key 与 Guardian API Key。
-输出：页面渲染；操作区副作用：网络请求 + SQLite 写入。
-上下游：依赖 core.db、crawler.orchestrator、crawler.agentic_crawl；
+输入：MySQL（articles / article_extractions）供看板只读；DB_PATH 仅 Agent 演示写 SQLite。
+输出：页面渲染；操作区副作用：网络请求 + MySQL（卫报同步）或 SQLite（Agent）。
+上下游：依赖 core.mysql_dashboard、core.db（init/save_incident）、crawler.orchestrator、crawler.agentic_crawl；
         由 systemd 在服务器持续运行，Nginx 反代对外暴露。
 """
 
@@ -13,28 +13,152 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sqlite3
 import sys
 from datetime import datetime
-from typing import List, Tuple
+from typing import Optional, Tuple
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
-from core.config import API_KEY, BASE_URL, DB_PATH, GUARDIAN_API_KEY
-from core.db import (
-    get_risk_taxonomy_df,
-    get_stats,
-    get_watched_keywords,
-    incident_from_extraction,
-    init_db,
-    save_incident,
+from core.config import (
+    API_KEY,
+    BASE_URL,
+    DB_PATH,
+    GUARDIAN_API_KEY,
+    LLM_MODEL,
+    MYSQL_DATABASE,
+    MYSQL_HOST,
+    MYSQL_PORT,
 )
+from core.db import coerce_risk_domain, incident_from_extraction, init_db, save_incident
+from core.llm_client import OpenAICompatibleBackend
+from core.mysql_dashboard import (
+    fetch_dashboard_all_rows,
+    fetch_dashboard_latest_rows,
+    get_dashboard_keywords_df,
+    get_dashboard_stats,
+    get_dashboard_taxonomy_df,
+)
+from core.mysql_db import get_research_report_by_id, list_research_reports, save_research_report
+from engine.rag_ingestion.hybrid_retrieval import evidence_hits_to_report_sources, hybrid_retrieve
+from engine.research_report import generate_research_report_markdown
 from models.schema import RISK_DOMAIN_CHOICES
 
 # Windows 下 Playwright 子进程兼容
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+# 环形图配色（与页面深色主题一致）
+_DONUT_COLORS = (
+    "#4f8ef7",
+    "#3db88a",
+    "#a78bfa",
+    "#f0ab43",
+    "#e879a8",
+    "#5eb3f6",
+    "#7dd3c0",
+    "#c4b5fd",
+    "#fbbf24",
+    "#fb923c",
+    "#38bdf8",
+    "#94a3b8",
+)
+
+
+def _donut_color_list(n: int) -> list[str]:
+    base = list(_DONUT_COLORS)
+    out: list[str] = []
+    while len(out) < n:
+        out.extend(base)
+    return out[:n]
+
+
+def _fig_domain_donut(labels: list[str], values: list[int]) -> go.Figure:
+    n = len(labels)
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=labels,
+                values=values,
+                hole=0.54,
+                pull=[0.025] * n,
+                marker=dict(
+                    colors=_donut_color_list(n),
+                    line=dict(color="#0f1424", width=2),
+                ),
+                textinfo="percent",
+                textposition="inside",
+                textfont=dict(color="#e8eaf6", size=13),
+                insidetextorientation="horizontal",
+                hovertemplate="<b>%{label}</b><br>篇数: %{value}<br>占比: %{percent}<extra></extra>",
+                sort=False,
+            )
+        ]
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=True,
+        legend=dict(
+            orientation="v",
+            yanchor="middle",
+            y=0.5,
+            x=1.02,
+            xanchor="left",
+            font=dict(color="#a8b3cf", size=11),
+            bgcolor="rgba(0,0,0,0)",
+            itemwidth=30,
+        ),
+        margin=dict(t=20, b=20, l=20, r=190),
+        height=360,
+    )
+    return fig
+
+
+def _fig_subdomain_donut(labels: list[str], values: list[int]) -> go.Figure:
+    n = len(labels)
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                labels=labels,
+                values=values,
+                hole=0.54,
+                pull=[0.018] * n,
+                marker=dict(
+                    colors=_donut_color_list(n),
+                    line=dict(color="#0f1424", width=2),
+                ),
+                textinfo="percent",
+                textposition="inside",
+                textfont=dict(color="#e8eaf6", size=11),
+                insidetextorientation="horizontal",
+                hovertemplate="<b>%{label}</b><br>篇数: %{value}<br>占比: %{percent}<extra></extra>",
+                sort=False,
+            )
+        ]
+    )
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=True,
+        legend=dict(
+            orientation="v",
+            yanchor="middle",
+            y=0.5,
+            x=1.02,
+            xanchor="left",
+            font=dict(color="#a8b3cf", size=9),
+            bgcolor="rgba(0,0,0,0)",
+            itemwidth=30,
+        ),
+        margin=dict(t=20, b=20, l=20, r=240),
+        height=400,
+    )
+    return fig
+
 
 # ---------------------------------------------------------------------------
 # 缓存包装：所有只读查询加 2 分钟缓存，翻 Tab 不重查库
@@ -42,82 +166,57 @@ if sys.platform == "win32":
 
 @st.cache_data(ttl=120)
 def _cached_stats() -> Tuple[int, int, int]:
-    """功能：缓存版 get_stats；输出：(incidents 数, 标签去重数, 子域种数)。"""
+    """功能：缓存版 MySQL 汇总；输出：(extractions 数, 标签去重数, 主域×子域组合种数)。"""
     try:
-        return get_stats()
+        return get_dashboard_stats()
     except Exception:
         return 0, 0, 0
 
 
 @st.cache_data(ttl=120)
 def _cached_taxonomy() -> pd.DataFrame:
-    """功能：缓存版 get_risk_taxonomy_df；输出：risk_taxonomy DataFrame。"""
+    """功能：缓存版主域×子域频次（MySQL JSON 展开聚合）。"""
     try:
-        return get_risk_taxonomy_df()
+        return get_dashboard_taxonomy_df()
     except Exception:
-        return pd.DataFrame(columns=["domain", "subdomain", "count", "first_seen"])
+        return pd.DataFrame(columns=["domain", "subdomain", "tax_count", "first_seen"])
 
 
 @st.cache_data(ttl=120)
 def _cached_keywords() -> pd.DataFrame:
-    """功能：缓存版 get_watched_keywords；输出：watched_keywords DataFrame。"""
+    """功能：缓存版 tags_raw 聚合高频词（Top 60）。"""
     try:
-        return get_watched_keywords()
+        return get_dashboard_keywords_df()
     except Exception:
         return pd.DataFrame(columns=["keyword", "count"])
 
 
 @st.cache_data(ttl=60)
 def _cached_latest_incidents(limit: int = 20) -> pd.DataFrame:
-    """功能：缓存最新 incidents 列表；输入：limit；输出：DataFrame。"""
+    """功能：缓存最新情报列表（MySQL）；输入：limit；输出：DataFrame。"""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        df = pd.read_sql_query(
-            """
-            SELECT title,
-                   COALESCE(NULLIF(trim(risk_level), ''), category) AS 风险等级,
-                   risk_domain                                       AS 主域,
-                   risk_subdomain                                    AS 子域,
-                   entity                                            AS 涉及主体,
-                   url                                               AS 来源,
-                   timestamp                                         AS 时间
-            FROM incidents
-            ORDER BY timestamp DESC
-            LIMIT ?
-            """,
-            conn,
-            params=(limit,),
-        )
-        conn.close()
-        return df
+        return fetch_dashboard_latest_rows(limit)
     except Exception:
         return pd.DataFrame()
 
 
 @st.cache_data(ttl=60)
 def _cached_all_incidents() -> pd.DataFrame:
-    """功能：缓存全量 incidents 供详情 Tab 筛选；输出：DataFrame。"""
+    """功能：缓存全量情报供详情 Tab 筛选（MySQL）。"""
     try:
-        conn = sqlite3.connect(DB_PATH)
-        df = pd.read_sql_query(
-            """
-            SELECT id,
-                   title                                             AS 标题,
-                   COALESCE(NULLIF(trim(risk_level), ''), category) AS 风险等级,
-                   risk_domain                                       AS 主域,
-                   risk_subdomain                                    AS 子域,
-                   entity                                            AS 涉及主体,
-                   content                                           AS 摘要,
-                   url                                               AS 来源,
-                   tags                                              AS 标签,
-                   timestamp                                         AS 时间
-            FROM incidents
-            ORDER BY timestamp DESC
-            """,
-            conn,
-        )
-        conn.close()
-        return df
+        return fetch_dashboard_all_rows()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=30)
+def _cached_research_report_list(limit: int = 25) -> pd.DataFrame:
+    """近期深度调研报告列表（MySQL research_reports）。"""
+    try:
+        rows = list_research_reports(limit=limit)
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows)
     except Exception:
         return pd.DataFrame()
 
@@ -147,7 +246,7 @@ def main() -> None:
     """
     功能：配置页面、渲染三 Tab 看板与侧边栏演示操作区。
     输入：无参数；依赖 Streamlit session 与环境变量。
-    输出：无；副作用：init_db；操作区触发时写 SQLite 与网络请求。
+    输出：无；副作用：init_db（Agent SQLite）；只读看板查 MySQL。
     """
     st.set_page_config(
         page_title="全球 AI 治理监测系统",
@@ -215,8 +314,8 @@ def main() -> None:
 
     st.divider()
 
-    # --- 三 Tab 看板 ---
-    tab1, tab2, tab3 = st.tabs(["📊 监测看板", "📋 情报详情", "⚙️ 系统状态"])
+    # --- 四 Tab 看板 ---
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 监测看板", "📋 情报详情", "📚 深度调研", "⚙️ 系统状态"])
 
     # ================================================================
     # Tab 1 - 监测看板
@@ -245,7 +344,25 @@ def main() -> None:
                 st.info("暂无监测数据，请从演示操作区触发同步。")
 
             # 三元主域分布
-            st.markdown('<div class="section-header" style="margin-top:24px">🌳 动态风险分类体系（三元主域 → 子域）</div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div class="section-header" style="margin-top:24px">'
+                "🌳 动态风险分类体系（三元主域 → 子域）</div>",
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                "主域划分对齐 AI 安全与治理领域通行的「意图—来源」三类风险表述，便于与主流政策与学术话语对接；"
+                "子域由抽取结果与语料统计动态演化。"
+            )
+            with st.expander("分类口径与依据（说明）", expanded=False):
+                st.markdown(
+                    """
+**三元主域**对应学界与产业常用的风险分层：**恶意滥用**（Malicious Use）、**意外失效**
+（Accidental Failure / 可靠性）、**系统性与伦理风险**（Systemic & Ethical），与 NIST AI RMF、
+OECD AI 原则、欧盟《人工智能法案》等国内外治理框架中的风险维度在**语义上可对齐**（非对某一条款的逐字映射）。
+
+**子域**为在各主域下由模型标注、检索增强与词频统计共同沉淀的议题标签，会随监测语料扩充而**自动演化**。
+                    """.strip()
+                )
             tax_df = _cached_taxonomy()
             if not tax_df.empty:
                 dom_cols = st.columns(3)
@@ -258,31 +375,46 @@ def main() -> None:
                             st.caption("—")
                         else:
                             for _, row in sub_df.iterrows():
-                                st.caption(f"· {row['subdomain']}（×{int(row['count'])}）")
+                                st.caption(f"· {row['subdomain']}（×{int(row['tax_count'])}）")
             else:
                 st.caption("子域数据积累中，入库带 risk_subdomain 的情报后自动更新。")
 
         with right:
-            # 风险主域分布饼图（用 bar chart 替代，无需额外库）
             st.markdown('<div class="section-header">📊 风险主域分布</div>', unsafe_allow_html=True)
             tax_df_r = _cached_taxonomy()
             if not tax_df_r.empty:
-                # 按主域聚合 count
-                domain_agg = (
-                    tax_df_r.groupby("domain")["count"].sum().reset_index()
-                )
+                domain_agg = tax_df_r.groupby("domain")["tax_count"].sum().reset_index()
                 domain_agg["主域"] = (
                     domain_agg["domain"].str.replace(r"\s*\(.+$", "", regex=True).str.strip()
                 )
-                domain_agg = domain_agg.rename(columns={"count": "情报数"})
-                st.bar_chart(domain_agg.set_index("主域")["情报数"])
+                domain_agg = domain_agg.rename(columns={"tax_count": "情报数"})
+                fig_domain = _fig_domain_donut(
+                    domain_agg["主域"].tolist(),
+                    pd.to_numeric(domain_agg["情报数"], errors="coerce").fillna(0).astype(int).tolist(),
+                )
+                st.plotly_chart(fig_domain, use_container_width=True)
 
-                # Top 子域频次
-                st.markdown('<div class="section-header" style="margin-top:20px">🔥 高频风险子域 Top 12</div>', unsafe_allow_html=True)
-                top_sub = tax_df_r.sort_values("count", ascending=False).head(12).copy()
-                short_dom = top_sub["domain"].str.replace(r"\s*\(.+$", "", regex=True)
-                top_sub["子域"] = top_sub["subdomain"] + " · " + short_dom
-                st.bar_chart(top_sub.set_index("子域")["count"].rename("次数"))
+                st.markdown(
+                    '<div class="section-header" style="margin-top:20px">'
+                    "🔥 高频风险子域 (Top 8 + 其他)</div>",
+                    unsafe_allow_html=True,
+                )
+                sub_sorted = tax_df_r.sort_values("tax_count", ascending=False).reset_index(drop=True)
+                short_dom = sub_sorted["domain"].str.replace(r"\s*\(.+$", "", regex=True).str.strip()
+                if len(sub_sorted) > 8:
+                    head = sub_sorted.head(8)
+                    short_h = short_dom.head(8)
+                    labels = (head["subdomain"] + " · " + short_h).tolist()
+                    vals = pd.to_numeric(head["tax_count"], errors="coerce").fillna(0).astype(int).tolist()
+                    other_count = int(pd.to_numeric(sub_sorted["tax_count"].iloc[8:], errors="coerce").fillna(0).sum())
+                    if other_count > 0:
+                        labels.append("其他")
+                        vals.append(other_count)
+                else:
+                    labels = (sub_sorted["subdomain"] + " · " + short_dom).tolist()
+                    vals = pd.to_numeric(sub_sorted["tax_count"], errors="coerce").fillna(0).astype(int).tolist()
+                fig_sub = _fig_subdomain_donut(labels, vals)
+                st.plotly_chart(fig_sub, use_container_width=True)
             else:
                 st.caption("暂无分类统计数据。")
 
@@ -312,19 +444,19 @@ def main() -> None:
             # 筛选条件
             fc1, fc2, fc3 = st.columns(3)
             with fc1:
-                domains = ["全部"] + sorted(df_all["主域"].dropna().unique().tolist())
-                sel_domain = st.selectbox("按主域筛选", domains, key="filter_domain")
+                domains = ["全部"] + list(RISK_DOMAIN_CHOICES)
+                sel_domain = st.selectbox("按主域筛选（三元模型）", domains, key="filter_domain")
             with fc2:
-                levels = ["全部"] + sorted(df_all["风险等级"].dropna().unique().tolist())
-                sel_level = st.selectbox("按风险等级筛选", levels, key="filter_level")
+                levels = ["全部"] + sorted(df_all["资讯类别"].dropna().unique().tolist())
+                sel_level = st.selectbox("按资讯类别筛选", levels, key="filter_level")
             with fc3:
                 kw_search = st.text_input("关键词搜索（标题/摘要）", key="kw_search")
 
             df_view = df_all.copy()
             if sel_domain != "全部":
-                df_view = df_view[df_view["主域"] == sel_domain]
+                df_view = df_view[df_view["主域"].map(lambda x: coerce_risk_domain(str(x))) == sel_domain]
             if sel_level != "全部":
-                df_view = df_view[df_view["风险等级"] == sel_level]
+                df_view = df_view[df_view["资讯类别"] == sel_level]
             if kw_search.strip():
                 mask = (
                     df_view["标题"].str.contains(kw_search, case=False, na=False)
@@ -357,14 +489,14 @@ def main() -> None:
             df_report = _cached_latest_incidents(10)
             if not df_report.empty:
                 report_md = f"## AI 治理动态监测内参（{datetime.now().strftime('%Y-%m-%d')}）\n\n"
-                report_md += "### 一、核心风险预警\n\n"
+                report_md += "### 一、最新情报摘要\n\n"
                 for _, row in df_report.iterrows():
-                    lvl = str(row.get("风险等级", "") or "").strip()
+                    ctype = str(row.get("资讯类别", "") or "").strip()
                     dom = str(row.get("主域", "") or "").strip()
                     sub = str(row.get("子域", "") or "").strip()
                     entity = str(row.get("涉及主体", "") or "").strip()
                     tri = f"{dom} / {sub}".strip(" /")
-                    report_md += f"- **[{lvl or '—'}]** {row['title']}（涉及主体：{entity or '—'}）"
+                    report_md += f"- **[{ctype or '—'}]** {row['title']}（涉及主体：{entity or '—'}）"
                     if tri:
                         report_md += f" — 分类：{tri}"
                     report_md += "\n"
@@ -394,9 +526,164 @@ def main() -> None:
                 st.warning("数据库暂无数据，请先触发同步。")
 
     # ================================================================
-    # Tab 3 - 系统状态
+    # Tab 3 - 问答式深度调研（混合检索 + LLM 报告）
     # ================================================================
     with tab3:
+        st.markdown(
+            '<div class="section-header">📚 问答式深度调研</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "基于 Chroma 向量 + MySQL 全文（若已迁移）混合检索证据，由大模型生成带引用的 Markdown 报告；"
+            "可选择写入 `research_reports` 便于留痕。"
+        )
+        rq = st.text_area(
+            "研究问题",
+            height=88,
+            placeholder="例如：欧盟 AI 法案执法近期有哪些公开讨论？",
+            key="deep_research_question",
+        )
+        dr1, dr2, dr3 = st.columns(3)
+        with dr1:
+            dom_opts = ["（不筛选）"] + list(RISK_DOMAIN_CHOICES)
+            dr_domain_sel = st.selectbox("主域筛选（可选）", dom_opts, key="dr_domain")
+            dr_risk_domain = None if dr_domain_sel.startswith("（") else dr_domain_sel
+        with dr2:
+            dr_source = st.text_input("信源 source 精确匹配（可选）", "", key="dr_source")
+        with dr3:
+            dr_top_k = st.slider("纳入证据条数", 6, 32, 16, key="dr_top_k")
+
+        dr_save = st.checkbox("生成后写入 MySQL（research_reports + 引用行）", value=True, key="dr_save")
+        dr_preview = st.checkbox("仅检索证据、暂不调用 LLM（调试用）", value=False, key="dr_preview")
+
+        if st.button("🔎 检索并生成报告", type="primary", use_container_width=True, key="dr_run"):
+            if not (rq or "").strip():
+                st.warning("请先填写研究问题。")
+            elif not API_KEY:
+                st.error("未配置 DASHSCOPE_API_KEY，无法调用大模型生成报告。")
+            else:
+                hits = []
+                report_md = ""
+                retrieve_err: Optional[Exception] = None
+                gen_err: Optional[Exception] = None
+                with st.spinner("正在混合检索并生成报告（篇幅较长时可能需要 1～3 分钟）…"):
+                    try:
+                        tk = int(dr_top_k)
+                        pool = min(64, max(28, tk * 4))
+                        hits = hybrid_retrieve(
+                            rq.strip(),
+                            top_k=tk,
+                            risk_domain=dr_risk_domain,
+                            source=(dr_source or "").strip() or None,
+                            vector_top_n=pool,
+                            sparse_top_n=pool,
+                            max_chunks_per_article=3,
+                        )
+                    except Exception as e:
+                        retrieve_err = e
+                        hits = []
+
+                    if retrieve_err is None and hits and not dr_preview:
+                        try:
+                            backend = OpenAICompatibleBackend()
+                            report_md = generate_research_report_markdown(
+                                rq.strip(),
+                                hits,
+                                backend=backend,
+                                model=LLM_MODEL,
+                            )
+                        except Exception as e:
+                            gen_err = e
+                            report_md = ""
+
+                if retrieve_err is not None:
+                    st.error(f"检索失败：{type(retrieve_err).__name__}: {retrieve_err}")
+                elif hits:
+                    st.success(f"已检索 **{len(hits)}** 条证据（RRF 融合后；每篇最多 3 块）。")
+                    with st.expander("证据预览", expanded=False):
+                        for idx, h in enumerate(hits, 1):
+                            prev = (h.chunk_text or "").replace("\n", " ")[:220]
+                            st.caption(f"**{idx}.** article_id={h.article_id} rrf={h.rrf_score:.4f} — {prev}…")
+
+                if dr_preview:
+                    st.info("已开启「仅检索」：跳过 LLM；取消勾选后可生成完整报告。")
+                elif retrieve_err is not None:
+                    pass
+                elif not hits:
+                    st.warning("无命中证据，未生成正文。")
+                elif gen_err is not None:
+                    st.error(f"报告生成失败：{type(gen_err).__name__}: {gen_err}")
+                elif not (report_md or "").strip():
+                    st.warning("模型返回为空，请重试或检查 API/模型与上下文长度限制。")
+                else:
+                    st.markdown(report_md)
+                    src_payload = evidence_hits_to_report_sources(hits)
+                    filt = {
+                        "risk_domain": dr_risk_domain or "",
+                        "source": (dr_source or "").strip(),
+                        "top_k": int(dr_top_k),
+                    }
+                    if dr_save:
+                        try:
+                            rid = save_research_report(
+                                rq.strip(),
+                                filt,
+                                report_md,
+                                model_name=LLM_MODEL,
+                                sources=src_payload,
+                            )
+                            st.caption(f"已保存至 MySQL，`research_reports.id` = **{rid}**")
+                            st.cache_data.clear()
+                        except Exception as e:
+                            st.warning(f"报告已展示，但入库失败：{type(e).__name__}: {e}")
+
+                    fn = f"DeepResearch_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
+                    st.download_button(
+                        "下载 Markdown 报告",
+                        data=report_md.encode("utf-8"),
+                        file_name=fn,
+                        mime="text/markdown",
+                        key="dr_dl_md",
+                    )
+
+        st.divider()
+        st.markdown("**近期已保存报告**")
+        hist = _cached_research_report_list(30)
+        if hist.empty:
+            st.caption("暂无历史记录；成功保存后此处刷新可见（约 30s 内缓存）。")
+        else:
+            records = hist.to_dict("records")
+            pick_i = st.selectbox(
+                "选择一条查看",
+                range(len(records)),
+                format_func=lambda i: (
+                    f"#{int(records[i]['id'])} — "
+                    f"{str(records[i].get('question') or '')[:60]}"
+                ),
+                key="dr_hist_pick",
+            )
+            if st.button("载入所选报告", key="dr_hist_load"):
+                hid = int(records[pick_i]["id"])
+                try:
+                    row = get_research_report_by_id(hid)
+                    if row and row.get("report_markdown"):
+                        st.markdown(str(row["report_markdown"]))
+                        if row.get("sources"):
+                            with st.expander("引用行（research_report_sources）"):
+                                st.dataframe(
+                                    pd.DataFrame(row["sources"]),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                    else:
+                        st.warning("未找到该报告。")
+                except Exception as e:
+                    st.error(f"加载失败：{type(e).__name__}: {e}")
+
+    # ================================================================
+    # Tab 4 - 系统状态
+    # ================================================================
+    with tab4:
         sc1, sc2 = st.columns(2)
 
         with sc1:
@@ -413,12 +700,14 @@ def main() -> None:
             else:
                 st.warning("Guardian API Key 未配置（可选）", icon="⚠️")
 
-            st.markdown("**数据库统计**")
+            st.markdown("**数据库统计（看板数据源：MySQL）**")
             s1, s2, s3 = _cached_stats()
-            st.caption(f"• incidents 表：{s1} 条")
-            st.caption(f"• risk_taxonomy：{taxonomy_kinds} 个子域")
-            st.caption(f"• watched_keywords：{kw_total} 个词")
-            st.caption(f"• 数据库路径：`{DB_PATH}`")
+            st.caption(f"• article_extractions：{s1} 条")
+            st.caption(f"• 去重标签（全库）：{s2} 个")
+            st.caption(f"• 主域×子域组合：{s3} 种")
+            st.caption(f"• 高频词池（展示 Top）：{kw_total} 个")
+            st.caption(f"• MySQL：`{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}`")
+            st.caption(f"• Agent 本地库（SQLite）：`{DB_PATH}`")
 
         with sc2:
             st.markdown('<div class="section-header">📡 信源配置</div>', unsafe_allow_html=True)
@@ -553,12 +842,13 @@ def main() -> None:
 **核心能力**
 - 卫报 Content API 定时同步
 - 任意 URL 深度 Agent 侦察
+- 问答式深度调研（混合检索 + 报告留痕）
 - LLM 并发抽取（5 路并发）
 - RAG 增强风险子域精炼
 - 自增长关键词与子域体系
 
 **技术栈**
-Python · Streamlit · SQLite  
+Python · Streamlit · MySQL  
 Crawl4AI · ChromaDB · httpx
         """)
         st.divider()

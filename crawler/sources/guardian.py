@@ -4,7 +4,7 @@ The Guardian Content API 客户端（search）：拉取与 AI 安全、治理相
 功能：用 httpx 调用 /search，解析 results 为 RawArticle；支持 show-fields 获取导语与正文。
 输入：可选覆盖 api_key/base_url（默认 core.config）；query 默认指向 AI 安全与治理相关英文检索词。
 输出：RawArticle 列表与分页元数据；失败抛出 GuardianAPIError。
-上下游：供 orchestrator、scripts/smoke_guardian 调用；下游可将 RawArticle 拼文本后走 LLM 抽取（models.ExtractionResult）。
+上下游：供 orchestrator、scripts/smoke_guardian 调用；下游可将 RawArticle 拼文本后走 LLM 文章级抽取（models.ArticleExtractionPayload）。
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from core.config import GUARDIAN_API_BASE, GUARDIAN_API_KEY
 
 # ---------------------------------------------------------------------------
 # 默认检索：卫报为英文稿，用英文关键词覆盖 AI 安全、治理、监管、伦理与对齐等语义。
-# 说明：search 为相关性排序，不保证条条命中；后续可由 LLM 按 ExtractionResult 再过滤。
+# 说明：search 为相关性排序，不保证条条命中；后续由 LLM 按文章级 payload 再过滤。
 # ---------------------------------------------------------------------------
 # 不使用 OR/括号布尔语法（各环境索引行为不一），用高密度英文词偏向 AI 安全、治理、监管与伦理报道。
 #人工智能、AI 安全、治理、监管、政策、伦理、对齐、机器学习、大语言模型

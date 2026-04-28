@@ -27,6 +27,26 @@ EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
 DB_PATH: str = os.getenv("DB_PATH", "ai_governance.db")
 # Chroma 子域向量库（本地目录，非独立服务）
 CHROMA_PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "chroma_data")
+# Chroma 文章全文向量库（与子域向量库独立存放，避免 collection 命名冲突）
+ARTICLE_CHROMA_DIR: str = os.getenv("ARTICLE_CHROMA_DIR", "chroma_articles")
+
+# 文章正文分块（字符近似；后续可换 tokenizer）
+try:
+    INDEX_CHUNK_TARGET_CHARS: int = int(os.getenv("INDEX_CHUNK_TARGET_CHARS", "3200"))
+except ValueError:
+    INDEX_CHUNK_TARGET_CHARS = 3200
+try:
+    INDEX_CHUNK_MAX_CHARS: int = int(os.getenv("INDEX_CHUNK_MAX_CHARS", "4500"))
+except ValueError:
+    INDEX_CHUNK_MAX_CHARS = 4500
+try:
+    INDEX_CHUNK_OVERLAP_CHARS: int = int(os.getenv("INDEX_CHUNK_OVERLAP_CHARS", "150"))
+except ValueError:
+    INDEX_CHUNK_OVERLAP_CHARS = 150
+try:
+    INDEX_SUMMARY_MAX_CHARS: int = int(os.getenv("INDEX_SUMMARY_MAX_CHARS", "6000"))
+except ValueError:
+    INDEX_SUMMARY_MAX_CHARS = 6000
 
 # --- Guardian Open Platform---
 # 功能：供 crawler.sources.guardian 等模块构造 search 请求；空字符串表示未配置。
@@ -52,3 +72,17 @@ CRAWL_WAIT_UNTIL: str = (os.getenv("CRAWL_WAIT_UNTIL", "commit") or "commit").st
 # --- RAG 子域路由（高频路径）---
 RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "8"))
 RAG_ENABLED: bool = os.getenv("RAG_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+
+# --- MySQL (Phase 1 event-driven schema) ---
+MYSQL_HOST: str = os.getenv("MYSQL_HOST", "localhost").strip()
+try:
+    MYSQL_PORT: int = int(os.getenv("MYSQL_PORT", "3306"))
+except ValueError:
+    MYSQL_PORT = 3306
+MYSQL_USER: str = os.getenv("MYSQL_USER", "root").strip()
+MYSQL_PASSWORD: str = os.getenv("MYSQL_PASSWORD", "")
+MYSQL_DATABASE: str = os.getenv("MYSQL_DATABASE", "ai_governance").strip()
+MYSQL_CHARSET: str = os.getenv("MYSQL_CHARSET", "utf8mb4").strip() or "utf8mb4"
+
+# Structured extraction version for reproducible pipelines.
+EXTRACTOR_VERSION: str = os.getenv("EXTRACTOR_VERSION", "v1").strip() or "v1"
